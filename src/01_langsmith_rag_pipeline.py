@@ -10,6 +10,7 @@ NHIỆM VỤ:
 DELIVERABLE: Mở https://smith.langchain.com → project của bạn → xác nhận ≥ 50 traces.
 """
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -28,6 +29,10 @@ from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
 from qa_pairs import SAMPLE_QUESTIONS
 
 
+REQUEST_DELAY_SECONDS = 5.0
+MAX_RATE_LIMIT_RETRIES = 3
+
+
 # ── 1. Thiết lập Vectorstore ───────────────────────────────────────────────
 def setup_vectorstore():
     """
@@ -40,17 +45,17 @@ def setup_vectorstore():
         vectorstore = build_vectorstore(chunks, embeddings)
     """
     # TODO: Khởi tạo embeddings từ factory (1 dòng)
-    embeddings = ...
+    embeddings = get_embeddings()
 
     # TODO: Đọc nội dung knowledge base (1 dòng)
-    text = ...
+    text = load_knowledge_base()
 
     # TODO: Chia text thành chunks với chunk_size=500, chunk_overlap=50 (1 dòng)
-    chunks = ...
+    chunks = split_text(text, chunk_size=500, chunk_overlap=50)
     print(f"📚 Đã chia thành {len(chunks)} chunks")
 
     # TODO: Tạo FAISS vectorstore và trả về (1 dòng)
-    vectorstore = ...
+    vectorstore = build_vectorstore(chunks, embeddings)
     return vectorstore
 
 
@@ -60,7 +65,10 @@ def setup_vectorstore():
 #   ("human",  "{question}")
 #
 # Gợi ý: RAG_PROMPT = ChatPromptTemplate.from_messages([...])
-RAG_PROMPT = ...
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời.\n\nContext:\n{context}"),
+    ("human", "{question}"),
+])
 
 
 # ── 3. Build RAG Chain ─────────────────────────────────────────────────────
@@ -78,12 +86,12 @@ def build_rag_chain(vectorstore):
 
     # TODO: Tạo retriever từ vectorstore, lấy k=3 tài liệu gần nhất
     # Gợi ý: retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    retriever = ...
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
     # TODO: Định nghĩa hàm format_docs để ghép page_content của các docs thành 1 chuỗi
     # Gợi ý: "\n\n".join(doc.page_content for doc in docs)
     def format_docs(docs):
-        ...
+        return "\n\n".join(doc.page_content for doc in docs)
 
     # TODO: Xây dựng LCEL chain dùng pipe operator (|)
     # Gợi ý:
@@ -91,7 +99,15 @@ def build_rag_chain(vectorstore):
     #       {"context": retriever | format_docs, "question": RunnablePassthrough()}
     #       | RAG_PROMPT | llm | StrOutputParser()
     #   )
-    chain = ...
+    chain = (
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
+    )
 
     return chain, retriever
 
@@ -99,13 +115,21 @@ def build_rag_chain(vectorstore):
 # ── 4. Hàm Query có LangSmith Tracing ─────────────────────────────────────
 # TODO: Thêm decorator @traceable(name="rag-query", tags=["rag", "step1"])
 #       phía TRÊN chữ ký hàm để LangSmith tự động ghi lại input/output/latency
+@traceable(name="rag-query", tags=["rag", "step1"])
 def ask(chain, question: str) -> str:
     """
     Chạy RAG chain với một câu hỏi.
     Decorator @traceable sẽ gửi mỗi lần gọi lên LangSmith như một trace riêng.
     """
     # TODO: Gọi chain.invoke(question) và trả về kết quả
-    ...
+    return chain.invoke(question)
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Nhận diện lỗi HTTP 429 mà không phụ thuộc một SDK provider cụ thể."""
+    status_code = getattr(error, "status_code", None)
+    code = getattr(error, "code", None)
+    return status_code == 429 or code == 429 or "429" in str(error)
 
 
 # ── 5. Main ────────────────────────────────────────────────────────────────
@@ -118,18 +142,36 @@ def main():
         sys.exit(1)
 
     # TODO: Gọi setup_vectorstore() để tạo vectorstore
-    vectorstore = ...
+    vectorstore = setup_vectorstore()
 
     # TODO: Gọi build_rag_chain(vectorstore) để nhận chain và retriever
-    chain, retriever = ...
+    chain, retriever = build_rag_chain(vectorstore)
 
     # TODO: Lặp qua tất cả SAMPLE_QUESTIONS, gọi ask(), in câu hỏi và câu trả lời
+    retry_count = 0
     for i, question in enumerate(SAMPLE_QUESTIONS, 1):
-        answer = ...
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                answer = ask(chain, question)
+                break
+            except Exception as error:
+                if not is_rate_limit_error(error) or attempt == MAX_RATE_LIMIT_RETRIES:
+                    raise
+                retry_count += 1
+                backoff_seconds = REQUEST_DELAY_SECONDS * (2 ** attempt)
+                print(
+                    f"⚠️ Gemini rate limit ở câu {i}; "
+                    f"retry {attempt + 1}/{MAX_RATE_LIMIT_RETRIES} "
+                    f"sau {backoff_seconds:.1f}s"
+                )
+                time.sleep(backoff_seconds)
         print(f"[{i:02d}/{len(SAMPLE_QUESTIONS)}] Q: {question[:60]}")
         print(f"       A: {str(answer)[:100]}\n")
+        if i < len(SAMPLE_QUESTIONS):
+            time.sleep(REQUEST_DELAY_SECONDS)
 
     print(f"\n✅ {len(SAMPLE_QUESTIONS)} traces đã gửi lên LangSmith project '{config.LANGSMITH_PROJECT}'")
+    print(f"   Rate-limit retries: {retry_count}")
     print("   Mở https://smith.langchain.com để xem traces.")
 
 

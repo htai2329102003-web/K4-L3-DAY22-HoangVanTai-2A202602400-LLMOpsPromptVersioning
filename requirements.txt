@@ -6,6 +6,8 @@ langchain-text-splitters>=0.3.0
 
 # ── LLM Providers (cài tất cả để hỗ trợ đa provider) ─────────────
 langchain-openai>=0.3.0          # OpenAI + OpenRouter
+langchain-huggingface
+sentence-transformers
 langchain-anthropic>=0.1.0       # Anthropic Claude
 langchain-google-genai>=1.0.0    # Google Gemini
 langchain-ollama>=0.1.0          # Ollama (local)
